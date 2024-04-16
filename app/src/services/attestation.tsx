@@ -28,7 +28,8 @@ import { Subscription } from 'rxjs'
 import {
   attestationCredDefIds,
   isProofRequestingAttestation,
-  attestationCredentialRequired,
+  retrieveAndTrimAvailableAttestationCredentials,
+  credentialsMatchForAttestationProof,
 } from '../helpers/Attestation'
 import { removeExistingInvitationIfRequired } from '../helpers/BCIDHelper'
 import { BCState } from '../store'
@@ -100,7 +101,9 @@ export const AttestationProvider: React.FC<AttestationProviderParams> = ({ child
 
       if (Platform.OS === 'ios') {
         const shouldCacheKey = false
+        agent?.config.logger.info('Generating key for Apple attestation')
         const keyId = await generateKey(shouldCacheKey)
+        agent?.config.logger.info('Using Apple on-device attestation')
         const attestationAsBuffer = await appleAttestation(
           keyId,
           (infraMessage as RequestIssuanceInfrastructureMessage).nonce
@@ -111,13 +114,16 @@ export const AttestationProvider: React.FC<AttestationProviderParams> = ({ child
           key_id: keyId,
           attestation_object: attestationAsBuffer.toString('base64'),
         } as ChallengeResponseInfrastructureMessage
+        agent?.config.logger.info('On-device Apple attestation complete')
 
         return attestationResponse
       } else if (Platform.OS === 'android') {
+        agent?.config.logger.info('Checking if Play Integrity is available')
         const available = await isPlayIntegrityAvailable()
         if (!available) {
           return null
         }
+        agent?.config.logger.info('Using Play Integrity for attestation')
         const tokenString = await googleAttestation((infraMessage as RequestIssuanceInfrastructureMessage).nonce)
         const attestationResponse = {
           ...common,
@@ -125,6 +131,7 @@ export const AttestationProvider: React.FC<AttestationProviderParams> = ({ child
           attestation_object: tokenString,
         } as ChallengeResponseInfrastructureMessage
 
+        agent?.config.logger.info('On-device Google attestation complete')
         return attestationResponse
       } else {
         setLoading(false)
@@ -145,23 +152,28 @@ export const AttestationProvider: React.FC<AttestationProviderParams> = ({ child
 
       // officially start attestation process here
       setLoading(true)
+      agent.config.logger.info('Checking if proof is requesting attestation')
       // 1. Is the proof requesting an attestation credential
       if (!(await isProofRequestingAttestation(proof, agent))) {
         setLoading(false)
         return
       }
 
-      // 2. Does the wallet owner have a valid attestation credential
-      const required = await attestationCredentialRequired(agent, proof.id)
+      // 2. Does the wallet owner have a valid attestation credential that matches the proof
+      agent.config.logger.info('Retrieving and trimming attestation credentials')
+      const availableAttestationCredentials = await retrieveAndTrimAvailableAttestationCredentials(agent)
+      agent.config.logger.info('Checking if credentials match for attestation proof')
+      const credentialsMatchForProof = await credentialsMatchForAttestationProof(agent, proof)
 
       // 3. If yes, do nothing
-      if (!required) {
+      if (availableAttestationCredentials.length > 0 && credentialsMatchForProof) {
+        agent.config.logger.info('Valid attestation credentials already exist')
         setLoading(false)
-
         return
       }
 
       // 4. If no, start attestation flow by requesting a nonce from controller
+      agent.config.logger.info('Parsing attestation invitation')
       const invite = await agent.oob.parseInvitation(store.developer.environment.attestationInviteUrl)
 
       if (!invite) {
@@ -176,8 +188,10 @@ export const AttestationProvider: React.FC<AttestationProviderParams> = ({ child
         return
       }
 
+      agent.config.logger.info('Removing existing attestation invitation if required')
       await removeExistingInvitationIfRequired(agent, invite.id)
 
+      agent.config.logger.info('Receiving attestation invitation')
       const { connectionRecord } = await agent.oob.receiveInvitation(invite)
       if (!connectionRecord) {
         setLoading(false)
@@ -197,6 +211,7 @@ export const AttestationProvider: React.FC<AttestationProviderParams> = ({ child
 
       // this step will fail if there is more than one active connection record between a given wallet and
       // the traction instance which is why we need to removeExistingInvitationIfRequired above
+      agent.config.logger.info('Requesting attestation nonce from controller')
       await requestNonceDrpc(agent, connectedRecord)
     } catch (error: unknown) {
       setLoading(false)
@@ -222,6 +237,7 @@ export const AttestationProvider: React.FC<AttestationProviderParams> = ({ child
 
       // if it's a new offer, automatically accept
       if (record.state === CredentialState.OfferReceived) {
+        agent.config.logger.info('Accepting attestation credential offer')
         await agent.credentials.acceptOffer({
           credentialRecordId: record.id,
         })
@@ -229,6 +245,7 @@ export const AttestationProvider: React.FC<AttestationProviderParams> = ({ child
 
       // only finish loading state once credential is fully accepted
       if (record.state === CredentialState.Done) {
+        agent.config.logger.info('Attestation credential accepted')
         setLoading(false)
       }
     } catch (error: unknown) {
